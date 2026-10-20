@@ -1,0 +1,109 @@
+services:
+  openldap:
+    image: osixia/openldap:1.5.0
+    container_name: openldap
+    environment:
+      LDAP_ORGANISATION: "Example Corp"
+      LDAP_DOMAIN: "example.com"
+      LDAP_ADMIN_PASSWORD: "adminpassword"
+      # TLS explícito para LDAPS (636). La imagen genera un certificado
+      # autofirmado si no se le monta uno propio.
+      LDAP_TLS: "true"
+      LDAP_TLS_CRT_FILENAME: "ldap.crt"
+      LDAP_TLS_KEY_FILENAME: "ldap.key"
+      LDAP_TLS_CA_CRT_FILENAME: "ca.crt"
+      LDAP_TLS_ENFORCE: "false"
+      LDAP_TLS_VERIFY_CLIENT: "never"
+    ports:
+      - "389:389"
+      - "636:636"
+    volumes:
+      - ldap_data:/var/lib/ldap
+      - ldap_config:/etc/ldap/slapd.d
+    networks: [auth-network]
+
+  # Protección extra a nivel de puerto para LDAPS (636/TLS). Al ir el
+  # tráfico cifrado no podemos usar un filtro de Fail2Ban basado en logs en
+  # claro (como en frontend/backend/ldap-api), así que este sidecar comparte
+  # el namespace de red de "openldap" (network_mode: service) e instala una
+  # regla de iptables con el módulo "recent" que limita cuántas conexiones
+  # nuevas por segundo acepta el puerto 636 desde una misma IP.
+  ldap-guard:
+    build: ./ldap-guard
+    container_name: ldap-guard
+    network_mode: "service:openldap"
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      LDAPS_PORT: "636"
+      LDAPS_HITCOUNT: "20"
+      LDAPS_WINDOW_SECONDS: "10"
+    depends_on: [openldap]
+
+  phpldapadmin:
+    image: osixia/phpldapadmin:latest
+    container_name: phpldapadmin
+    environment:
+      PHPLDAPADMIN_LDAP_HOSTS: "openldap"
+      PHPLDAPADMIN_HTTPS: "false"
+    ports:
+      - "8080:80"
+    depends_on: [openldap]
+    networks: [auth-network]
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: keycloak-db
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: keycloakpassword
+    volumes:
+      - keycloak_db:/var/lib/postgresql/data
+    networks: [auth-network]
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.7.4
+    container_name: keycloak
+    command: start-dev --import-realm
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: adminpassword
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: keycloakpassword
+      KC_HTTP_PORT: 8080
+      KC_HOSTNAME: http://localhost:8081
+      KC_HOSTNAME_STRICT: "false"
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./keycloak/import:/opt/keycloak/data/import:ro
+    depends_on: [postgres, openldap]
+    networks: [auth-network]
+
+  api:
+    build: ./fastapi
+    container_name: ldap-oauth-api
+    ports:
+      - "8000:8000"
+    environment:
+      KEYCLOAK_INTERNAL: http://keycloak:8080
+      KEYCLOAK_PUBLIC: http://localhost:8081
+      KEYCLOAK_REALM: cybersecurity
+      KEYCLOAK_CLIENT_ID: fastapi-api
+    cap_add:
+      - NET_ADMIN   # Fail2Ban necesita esto para manejar reglas de iptables
+      - NET_RAW
+    depends_on: [keycloak]
+    networks: [auth-network]
+
+volumes:
+  ldap_data:
+  ldap_config:
+  keycloak_db:
+
+networks:
+  auth-network:
